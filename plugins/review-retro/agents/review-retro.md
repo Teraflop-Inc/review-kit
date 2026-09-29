@@ -15,7 +15,7 @@ You analyze PR review history. The data is already digested; do not call GitHub 
 Group threads by the class of problem, not by wording. Every thread may join at most one cluster. Categories:
 - `recurring`: a real problem class seen in 2+ threads (or 2+ PRs). `fixed` and `open_at_merge` outcomes are the strongest evidence it was real.
 - `noise`: findings the team rejected or ignored as low value: `thumbs_down`, `resolved_no_change`, or `ignored` where the finding is speculative, wrong, or repeats a project decision. `ignored` alone is not proof of noise; judge the body.
-- `human_only`: a human flagged it and no bot thread covers the same class in the scanned PRs.
+- `human_only`: a human flagged it and no bot thread covers the same class in the scanned PRs. This wins over `recurring`: a class only humans caught is `human_only` even when it recurs.
 - `stale_rule`: a rule in `meta.json` that no thread matches. Cite its `rule_ids`. Skip this category if there are no rules.
 
 Use short, stable kebab-case keys that describe the class (`secrets-in-logs`, `run-artifacts-committed`). If a knowledge base exists, reuse its keys for the same class.
