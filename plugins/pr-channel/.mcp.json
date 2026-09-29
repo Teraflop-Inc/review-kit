@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "pr-channel": {
+      "command": "bun",
+      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server/server.ts"],
+      "env": {
+        "INTAKE_URL": "${PR_CHANNEL_INTAKE_URL:-http://127.0.0.1:8788}",
+        "PR_CHANNEL_SUBSCRIBE": "${PR_CHANNEL_SUBSCRIBE:-}",
+        "CHANNEL_SERVER_NAME": "pr-channel"
+      }
+    }
+  }
+}

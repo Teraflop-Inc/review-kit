@@ -1,0 +1,12 @@
+{
+  "name": "claude-channel-pr",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub PR review webhooks -> notifications/claude/channel. No dependencies.",
+  "scripts": {
+    "intake": "bun run server/intake.ts",
+    "test": "bun test tests/meta.test.ts tests/normalize.test.ts tests/router.test.ts tests/signature.test.ts",
+    "e2e": "tests/run-e2e.sh"
+  }
+}

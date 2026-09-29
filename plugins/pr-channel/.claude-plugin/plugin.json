@@ -1,0 +1,17 @@
+{
+  "name": "pr-channel",
+  "description": "Channels server that streams GitHub PR review events (review comments, reviews, PR comments) into a running Claude Code session, with signed webhooks, per-PR subscriptions, and exactly one session answering each event.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Teraflop",
+    "email": "alex@teraflop.io"
+  },
+  "keywords": [
+    "github",
+    "pull-request",
+    "review",
+    "webhook",
+    "channel",
+    "mcp"
+  ]
+}
