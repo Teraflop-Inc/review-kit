@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""retro/kb: merge an analysis into the persistent knowledge base retro/issues.md.
+
+Deterministic, no LLM. The analyzer cites digest record ids; counts, PR lists, and
+first/last-seen dates are computed here from the digest, so reruns never double count.
+
+  retro/kb pull   --repo owner/name --out retro/issues.md
+      Download the latest knowledge base: from the newest open review-retro PR branch if
+      one exists (so runs chain before anyone merges), else from the default branch.
+      Leaves no file when neither has one (first run).
+  retro/kb merge  --kb retro/issues.md --digest DIR --analysis analysis.json
+      Validate the analysis and merge it into the knowledge base (created on first run).
+"""
+import argparse
+import base64
+import datetime as dt
+import json
+from pathlib import Path
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _gh import GhError, rest, split_repo  # noqa: E402
+
+CATEGORIES = {
+    "recurring": "Recurring real issues",
+    "human_only": "Human-only catches (a human flagged it, the bot missed it)",
+    "noise": "Noise (flagged, then ignored, dismissed, or thumbs-downed)",
+    "stale_rule": "Stale rules (never fired in the scanned PRs)",
+}
+BRANCH_PREFIX = "review-retro/"
+STATE_RE = re.compile(r"<!-- retro-state\n(.*?)\n-->", re.S)
+
+
+def load_digest(d):
+    recs = {}
+    with open(os.path.join(d, "digest.jsonl")) as fh:
+        for ln in fh:
+            if ln.strip():
+                r = json.loads(ln)
+                recs[r["id"]] = r
+    with open(os.path.join(d, "meta.json")) as fh:
+        return recs, json.load(fh)
+
+
+def validate(analysis, recs, meta):
+    """Return (clusters, errors). Drops unknown record ids; a cluster must end up citing a PR."""
+    scanned = {p["number"] for p in meta["prs"]}
+    rule_ids = {r["id"] for r in meta.get("rules", [])}
+    out, errors = [], []
+    for c in analysis.get("clusters", []):
+        key = re.sub(r"[^a-z0-9-]+", "-", str(c.get("key", "")).lower()).strip("-")
+        cat = c.get("category")
+        if not key or cat not in CATEGORIES:
+            errors.append(f"cluster {c.get('key')!r}: bad key or category {cat!r}")
+            continue
+        ids = [i for i in c.get("records", []) if i in recs]
+        bad = [i for i in c.get("records", []) if i not in recs]
+        if bad:
+            errors.append(f"cluster {key}: unknown record ids dropped: {bad}")
+        prs = sorted({recs[i]["pr"] for i in ids} | {int(p) for p in c.get("prs", []) if int(p) in scanned})
+        if cat == "stale_rule":
+            if not set(c.get("rule_ids", [])) & rule_ids:
+                errors.append(f"cluster {key}: stale_rule must name a rule id from meta.json")
+                continue
+            prs = prs or sorted(scanned)
+        if not prs:
+            errors.append(f"cluster {key}: cites no PR, dropped")
+            continue
+        out.append({"key": key, "category": cat, "title": c.get("title", key), "summary": c.get("summary", ""),
+                    "records": ids, "prs": prs, "rule_ids": c.get("rule_ids", [])})
+    return out, errors
+
+
+def read_state(path):
+    if not os.path.exists(path):
+        return None
+    m = STATE_RE.search(Path(path).read_text())
+    return json.loads(m.group(1)) if m else None
+
+
+def merge(state, clusters, recs, meta, today):
+    state = state or {"repo": meta["repo"], "created": today, "runs": [], "issues": {}}
+    for c in clusters:
+        dates = [recs[i]["merged_at"] for i in c["records"]]
+        prev = state["issues"].get(c["key"], {})
+        records = sorted(set(prev.get("records", [])) | set(c["records"]))
+        prs = sorted(set(prev.get("prs", [])) | set(c["prs"]))
+        if c["category"] == "stale_rule":           # a rule that never fired: dated by the runs that saw it idle
+            dates = [today]
+        seen = [d for d in [prev.get("first_seen"), prev.get("last_seen"), *dates] if d]
+        state["issues"][c["key"]] = {
+            "title": c["title"], "category": c["category"], "summary": c["summary"],
+            "records": records, "prs": prs, "rule_ids": c["rule_ids"],
+            "count": len(records) if c["category"] != "stale_rule" else prev.get("count", 0) + 1,
+            "first_seen": min(seen), "last_seen": max(seen),
+            "runs": prev.get("runs", 0) + 1,
+            "category_history": sorted(set(prev.get("category_history", [])) | {c["category"]}),
+        }
+    nums = [p["number"] for p in meta["prs"]]
+    state["runs"].append({"date": today, "prs": [min(nums), max(nums)] if nums else [], "pr_count": len(nums),
+                          "records": meta["records"], "clusters": len(clusters)})
+    state["updated"] = today
+    return state
+
+
+def render(state):
+    L = [f"# Review retro knowledge base: {state['repo']}", "",
+         "Maintained by `review-retro` (review-kit). Each run merges new findings in; nothing is removed. "
+         "Counts are distinct review threads (for stale rules: runs in which the rule never fired). "
+         "Dates are PR merge dates. Edit prose freely, but keep the `retro-state` block at the end intact.", ""]
+    for cat, heading in CATEGORIES.items():
+        items = sorted(((k, v) for k, v in state["issues"].items() if v["category"] == cat),
+                       key=lambda kv: (-kv[1]["count"], kv[0]))
+        L += [f"## {heading}", ""]
+        if not items:
+            L += ["None yet.", ""]
+            continue
+        L += ["| Issue | Count | First seen | Last seen | PRs |", "|---|---|---|---|---|"]
+        for k, v in items:
+            prs = ", ".join(f"#{p}" for p in v["prs"][-12:]) + (" …" if len(v["prs"]) > 12 else "")
+            L.append(f"| **{v['title']}** (`{k}`)<br>{v['summary']} | {v['count']} | {v['first_seen']} | "
+                     f"{v['last_seen']} | {prs} |")
+        L.append("")
+    L += ["## Runs", "", "| Date | PRs scanned | Records | Clusters |", "|---|---|---|---|"]
+    for r in state["runs"]:
+        rng = f"#{r['prs'][0]}–#{r['prs'][1]} ({r['pr_count']})" if r["prs"] else "0"
+        L.append(f"| {r['date']} | {rng} | {r['records']} | {r['clusters']} |")
+    L += ["", "<!-- retro-state", json.dumps(state, indent=1, sort_keys=True), "-->", ""]
+    return "\n".join(L)
+
+
+def open_retro_prs(owner, name):
+    prs, _ = rest(f"repos/{owner}/{name}/pulls?state=open&per_page=100")
+    return sorted((p for p in prs if p["head"]["ref"].startswith(BRANCH_PREFIX)
+                   and p["head"]["repo"] and p["head"]["repo"]["full_name"] == f"{owner}/{name}"),
+                  key=lambda p: p["number"], reverse=True)
+
+
+def get_file(owner, name, path, ref):
+    try:
+        data, _ = rest(f"repos/{owner}/{name}/contents/{path}?ref={ref}")
+        return base64.b64decode(data["content"]).decode()
+    except GhError as e:
+        if "404" in str(e) or "Not Found" in str(e):
+            return None
+        raise
+
+
+def cmd_pull(a):
+    owner, name = split_repo(a.repo)
+    refs = [p["head"]["ref"] for p in open_retro_prs(owner, name)]
+    repo, _ = rest(f"repos/{owner}/{name}")
+    for ref in [*refs[:1], repo["default_branch"]]:
+        text = get_file(owner, name, a.path, ref)
+        if text is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+            Path(a.out).write_text(text)
+            print(f"retro: knowledge base pulled from {ref}", file=sys.stderr)
+            return
+    if os.path.exists(a.out):
+        os.remove(a.out)
+    print("retro: no knowledge base yet (first run)", file=sys.stderr)
+
+
+def cmd_merge(a):
+    recs, meta = load_digest(a.digest)
+    analysis = json.loads(Path(a.analysis).read_text())
+    clusters, errors = validate(analysis, recs, meta)
+    for e in errors:
+        print(f"retro: {e}", file=sys.stderr)
+    today = a.today or dt.date.today().isoformat()
+    existed = os.path.exists(a.kb)
+    state = merge(read_state(a.kb), clusters, recs, meta, today)
+    os.makedirs(os.path.dirname(os.path.abspath(a.kb)), exist_ok=True)
+    Path(a.kb).write_text(render(state))
+    print(json.dumps({"kb": a.kb, "created": not existed, "clusters": len(clusters), "issues": len(state["issues"]),
+                      "runs": len(state["runs"]), "dropped": errors}))
+    if a.strict and errors:
+        sys.exit(2)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("pull")
+    p.add_argument("--repo", required=True)
+    p.add_argument("--path", default="retro/issues.md")
+    p.add_argument("--out", default="retro/issues.md")
+    m = sub.add_parser("merge")
+    m.add_argument("--kb", default="retro/issues.md")
+    m.add_argument("--digest", required=True, help="dir with digest.jsonl and meta.json")
+    m.add_argument("--analysis", required=True)
+    m.add_argument("--today", default=None, help=argparse.SUPPRESS)
+    m.add_argument("--strict", action="store_true", help="exit 2 if any cluster was dropped")
+    a = ap.parse_args(argv)
+    {"pull": cmd_pull, "merge": cmd_merge}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

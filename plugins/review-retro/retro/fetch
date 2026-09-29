@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""retro/fetch: pull review threads for the last N merged PRs into a compact JSONL digest.
+
+Deterministic, no LLM. One record per review thread (inline threads from any reviewer,
+plus non-empty top-level review bodies from human reviewers). Outcomes are derived
+mechanically; see OUTCOME RULES below and the plugin README.
+
+Usage:
+  retro/fetch --repo owner/name [--prs 20] [--out DIR] [--skip-paths 'docs/**,*.lock']
+              [--rules-file PATH] [--raw-dir DIR]
+
+Writes DIR/digest.jsonl and DIR/meta.json (PR list, current REVIEW.md rules, sizes).
+"""
+import argparse
+import datetime as dt
+import fnmatch
+import html
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _gh import GhError, graphql, rest, split_repo  # noqa: E402
+
+# OUTCOME RULES (first match wins):
+#   thumbs_down        the root comment has at least one THUMBS_DOWN reaction
+#   fixed              a commit after the comment's commit changed the flagged lines (or, for a
+#                      file-level comment, the file) before merge
+#   resolved_no_change the thread was resolved but the flagged lines were not changed
+#   open_at_merge      unresolved, not fixed, and someone other than the commenter replied
+#   ignored            unresolved, not fixed, no reply
+# Human top-level review bodies have no line: thumbs_down, else fixed if any commit landed
+# after the review, else resolved_no_change for APPROVED, else ignored.
+OUTCOMES = ("thumbs_down", "fixed", "resolved_no_change", "open_at_merge", "ignored")
+
+PR_LIST_Q = """
+query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){
+  defaultBranchRef{name}
+  pullRequests(states:MERGED,first:50,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){
+    pageInfo{hasNextPage endCursor}
+    nodes{number title mergedAt headRefOid author{login}}}}}"""
+
+PR_Q = """
+query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){
+  pullRequest(number:$number){
+    reviewThreads(first:50,after:$cursor){pageInfo{hasNextPage endCursor}
+      nodes{isResolved isOutdated path line originalLine startLine originalStartLine
+        comments(first:30){nodes{author{login __typename} body createdAt originalCommit{oid}
+          reactionGroups{content reactors{totalCount}}}}}}
+    reviews(first:50){nodes{author{login __typename} state body submittedAt
+      reactionGroups{content reactors{totalCount}}}}
+    commits(last:100){nodes{commit{oid committedDate}}}}}}"""
+
+
+def author_of(node):
+    a = node.get("author") or {}
+    login = a.get("login") or "ghost"
+    is_bot = a.get("__typename") == "Bot" or login.endswith("[bot]")
+    return login.removesuffix("[bot]"), "bot" if is_bot else "human"
+
+
+def reactions(node):
+    return {g["content"].lower(): g["reactors"]["totalCount"]
+            for g in node.get("reactionGroups") or [] if g["reactors"]["totalCount"]}
+
+
+_SEVERITY = re.compile(r'alt="(P[0-3])"|\*\*(Important|Nit|Pre-existing)[:*]', re.I)
+_STRIP = [
+    (re.compile(r"<details>.*?</details>", re.S | re.I), " "),            # fix prompts, collapsed chrome
+    (re.compile(r"```suggestion.*?```", re.S), " [suggested change] "),
+    (re.compile(r"```.*?```", re.S), " [code] "),
+    (re.compile(r"!\[[^\]]*\]\([^)]*\)"), " "),                           # markdown images
+    (re.compile(r"<img[^>]*>", re.I), " "),
+    (re.compile(r"<!--.*?-->", re.S), " "),
+    (re.compile(r"<[^>]+>"), " "),                                        # remaining tags
+    (re.compile(r"\[([^\]]+)\]\((?:https?:|#)[^)]*\)"), r"\1"),           # keep link text only
+    (re.compile(r"(?im)^.*(fix (it )?(in|with) (claude|cursor|codex)|react with|was this helpful|"
+                r"prompt to fix|greptile|coderabbit|copilot generated).*$"), " "),
+    (re.compile(r"(?i)\b(knowledge base|context|rules?) used:.*$", re.S), " "),   # trailing bot citations
+]
+_TITLE = re.compile(r"^\s*(?:<[^>]+>\s*)*\*\*([^*\n]{3,120})\*\*\s*\n?")   # leading bold title
+
+
+def clean(body, limit):
+    text = _TITLE.sub(lambda m: m.group(1).rstrip(".:") + ": ", body or "", count=1)
+    for pat, rep in _STRIP:
+        text = pat.sub(rep, text)
+    text = html.unescape(text)
+    text = re.sub(r"(?m)\*\*|__|`|^\s*[#>]+\s*", "", text)   # markdown emphasis and headings, not identifiers
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def severity(body):
+    m = _SEVERITY.search(body or "")
+    return (m.group(1) or m.group(2)).capitalize() if m else None
+
+
+def touched_old_lines(patch):
+    """Old-side line numbers a unified diff patch removes or inserts next to."""
+    touched, old = set(), 0
+    for ln in (patch or "").splitlines():
+        if ln.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,(\d+))? \+", ln)
+            old = int(m.group(1)) if m else old
+        elif ln.startswith("-"):
+            touched.add(old)
+            old += 1
+        elif ln.startswith("+"):
+            touched.update((old - 1, old))    # insertion sits between old-1 and old
+        elif not ln.startswith("\\"):
+            old += 1
+    return touched
+
+
+class Compare:
+    """Caches compare(base...head) per commit pair."""
+
+    def __init__(self, owner, name, stats):
+        self.owner, self.name, self.stats, self.cache = owner, name, stats, {}
+
+    def files(self, base, head):
+        key = (base, head)
+        if key not in self.cache:
+            try:
+                data, n = rest(f"repos/{self.owner}/{self.name}/compare/{base}...{head}")
+                self.stats["raw_compare_bytes"] += n
+                self.cache[key] = {f["filename"]: f for f in data.get("files", [])} | {
+                    f["previous_filename"]: f for f in data.get("files", []) if f.get("previous_filename")}
+            except GhError as e:
+                print(f"retro: compare {base[:7]}...{head[:7]} failed ({e}); using isOutdated", file=sys.stderr)
+                self.cache[key] = None
+        return self.cache[key]
+
+
+def lines_changed(cmp, thread, base, head):
+    if not base or base == head:
+        return False
+    files = cmp.files(base, head)
+    if files is None:
+        return bool(thread.get("isOutdated"))
+    f = files.get(thread["path"])
+    if f is None:
+        return False
+    if f["status"] in ("removed", "renamed") and not f.get("patch"):
+        return True
+    end = thread.get("originalLine")
+    if end is None:                                   # file-level comment
+        return True
+    if "patch" not in f:                              # too large or binary; fall back
+        return bool(thread.get("isOutdated"))
+    start = thread.get("originalStartLine") or end
+    return bool(touched_old_lines(f["patch"]) & set(range(start, end + 1)))
+
+
+def thread_outcome(root_react, fixed, resolved, replied):
+    if root_react.get("thumbs_down"):
+        return "thumbs_down"
+    if fixed:
+        return "fixed"
+    if resolved:
+        return "resolved_no_change"
+    return "open_at_merge" if replied else "ignored"
+
+
+def list_prs(owner, name, n, stats):
+    prs, cursor, default = [], None, None
+    while True:
+        data, b = graphql(PR_LIST_Q, owner=owner, name=name, cursor=cursor)
+        stats["raw_review_bytes"] += b
+        repo = data["repository"]
+        default = (repo.get("defaultBranchRef") or {}).get("name")
+        page = repo["pullRequests"]
+        prs += page["nodes"]
+        # UPDATED_AT order approximates merge order; overfetch, then sort by mergedAt.
+        if len(prs) >= 2 * n or not page["pageInfo"]["hasNextPage"]:
+            break
+        cursor = page["pageInfo"]["endCursor"]
+    prs.sort(key=lambda p: p["mergedAt"], reverse=True)
+    return prs[:n], default
+
+
+def fetch_pr(owner, name, number, stats):
+    threads, cursor, pr = [], None, None
+    while True:
+        data, b = graphql(PR_Q, owner=owner, name=name, number=number, cursor=cursor)
+        stats["raw_review_bytes"] += b
+        pr = data["repository"]["pullRequest"]
+        threads += pr["reviewThreads"]["nodes"]
+        if not pr["reviewThreads"]["pageInfo"]["hasNextPage"]:
+            break
+        cursor = pr["reviewThreads"]["pageInfo"]["endCursor"]
+    return threads, pr["reviews"]["nodes"], [c["commit"] for c in pr["commits"]["nodes"]]
+
+
+def skipped(path, globs):
+    return bool(path) and any(fnmatch.fnmatch(path, g) for g in globs)
+
+
+def records_for_pr(pr, owner, name, cmp, globs, body_limit, stats):
+    threads, reviews, commits = fetch_pr(owner, name, pr["number"], stats)
+    head, merged = pr["headRefOid"], pr["mergedAt"][:10]
+    base = {"pr": pr["number"], "pr_title": pr["title"], "merged_at": merged}
+    out = []
+    for i, t in enumerate(threads, 1):
+        comments = t["comments"]["nodes"]
+        if not comments or skipped(t["path"], globs):
+            continue
+        root = comments[0]
+        login, kind = author_of(root)
+        others = [c for c in comments[1:] if author_of(c)[0] != login]
+        commit = (root.get("originalCommit") or {}).get("oid")
+        fixed = lines_changed(cmp, t, commit, head)
+        react = reactions(root)
+        rec = {**base, "id": f"{pr['number']}-t{i}", "kind": "thread",
+               "file": t["path"], "line": t.get("originalLine"),
+               "author": login, "author_kind": kind, "severity": severity(root["body"]),
+               "body": clean(root["body"], body_limit),
+               "outcome": thread_outcome(react, fixed, t["isResolved"], bool(others)),
+               "reactions": react, "replies": len(comments) - 1}
+        if others:
+            rec["reply"] = clean(others[0]["body"], 200)
+        out.append(rec)
+    for i, r in enumerate(reviews, 1):
+        login, kind = author_of(r)
+        text = clean(r["body"], body_limit)
+        if kind == "bot" or len(text) < 20:   # bot summaries are chrome; "LGTM" is not a finding
+            continue
+        react = reactions(r)
+        later = any(c["committedDate"] > (r["submittedAt"] or "") for c in commits)
+        outcome = ("thumbs_down" if react.get("thumbs_down") else "fixed" if later
+                   else "resolved_no_change" if r["state"] == "APPROVED" else "ignored")
+        out.append({**base, "id": f"{pr['number']}-r{i}", "kind": "review", "file": None, "line": None,
+                    "author": login, "author_kind": kind, "severity": severity(r["body"]),
+                    "body": text, "outcome": outcome, "reactions": react, "replies": 0,
+                    "review_state": r["state"]})
+    return out
+
+
+def review_rules(owner, name, default, rules_file):
+    """Current REVIEW.md rules (bullets) from the default branch, or from --rules-file."""
+    text, source = None, None
+    if rules_file:
+        with open(rules_file) as fh:
+            text, source = fh.read(), rules_file
+    else:
+        try:
+            raw, _ = rest(f"repos/{owner}/{name}/contents/REVIEW.md?ref={default}")
+            import base64
+            text, source = base64.b64decode(raw["content"]).decode(), f"REVIEW.md@{default}"
+        except GhError:
+            return [], None
+    rules, section = [], ""
+    for ln in text.splitlines():
+        if ln.startswith("#"):
+            section = ln.lstrip("# ").strip()
+        elif re.match(r"^\s*[-*] ", ln):
+            rules.append({"id": f"R{len(rules) + 1}", "section": section, "text": ln.strip()[2:].strip()})
+    return rules, source
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--prs", type=int, default=20, help="number of most recently merged PRs (cap)")
+    ap.add_argument("--out", default=None, help="output dir (default .retro/<owner>__<name>)")
+    ap.add_argument("--skip-paths", default="", help="comma or newline separated globs to drop")
+    ap.add_argument("--rules-file", default=None, help="rules to check for staleness if not REVIEW.md")
+    ap.add_argument("--body-limit", type=int, default=400)
+    ap.add_argument("--raw-dir", default=None, help="also save raw API JSON here (for size audits)")
+    a = ap.parse_args(argv)
+    if a.prs < 1:
+        ap.error("--prs must be >= 1")
+    owner, name = split_repo(a.repo)
+    out_dir = a.out or os.path.join(".retro", f"{owner}__{name}")
+    os.makedirs(out_dir, exist_ok=True)
+    globs = [g.strip() for g in re.split(r"[,\n]", a.skip_paths) if g.strip()]
+    stats = {"raw_review_bytes": 0, "raw_compare_bytes": 0}
+
+    prs, default = list_prs(owner, name, a.prs, stats)
+    cmp = Compare(owner, name, stats)
+    records = []
+    for pr in prs:
+        recs = records_for_pr(pr, owner, name, cmp, globs, a.body_limit, stats)
+        pr["records"] = len(recs)
+        records += recs
+        print(f"retro: #{pr['number']} {len(recs)} records", file=sys.stderr)
+
+    digest = os.path.join(out_dir, "digest.jsonl")
+    with open(digest, "w") as fh:
+        for r in records:
+            fh.write(json.dumps(r, ensure_ascii=False, separators=(",", ":")) + "\n")
+    rules, rules_source = review_rules(owner, name, default, a.rules_file)
+    stats["digest_bytes"] = os.path.getsize(digest)
+    stats["raw_bytes"] = stats["raw_review_bytes"] + stats["raw_compare_bytes"]
+    count = lambda key: {v: sum(1 for r in records if r[key] == v) for v in sorted({r[key] for r in records})}
+    meta = {
+        "repo": a.repo, "default_branch": default,
+        "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "prs_requested": a.prs,
+        "prs": [{"number": p["number"], "title": p["title"], "merged_at": p["mergedAt"][:10],
+                 "records": p["records"]} for p in prs],
+        "records": len(records), "by_author_kind": count("author_kind"), "by_outcome": count("outcome"),
+        "by_author": count("author"),
+        "rules_source": rules_source, "rules": rules, "sizes": stats,
+    }
+    with open(os.path.join(out_dir, "meta.json"), "w") as fh:
+        json.dump(meta, fh, indent=2)
+    if a.raw_dir:
+        os.makedirs(a.raw_dir, exist_ok=True)
+    print(json.dumps({"digest": digest, "records": len(records), "prs": len(prs), **stats}))
+
+
+if __name__ == "__main__":
+    main()

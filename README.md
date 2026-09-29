@@ -92,9 +92,9 @@ Plugins in this repo's marketplace, installed with `/plugin marketplace add aowe
 
 Checks a PR against the acceptance criteria on its linked Linear issue and posts one comment: a verdict per criterion (`met`, `partial`, `missing`, or `not verifiable from diff`), with `file:line` evidence for everything it calls met or partial. The issue is found from the branch name, PR title, or body. Re-runs edit the same comment, and it never changes the Linear issue (report only). Run it locally with `/ac-check <pr> [issue]`, or on every PR with a caller pinned to `@v1`: [`plugins/ac-check/templates/caller-ac-check.yml`](plugins/ac-check/templates/caller-ac-check.yml). Needs `LINEAR_API_KEY`. Setup, secrets, token scopes, and pinning: [`plugins/ac-check/README.md`](plugins/ac-check/README.md).
 
-### Review retro (`review-retro`): coming
+### Review retro (`review-retro`)
 
-After merge, summarizes what the review caught and what it missed, so you can tune `REVIEW.md`. Tracked in ENG2-1655.
+A scheduled background job, not a reviewer. It mines the review threads on your last N merged PRs into a knowledge base (`retro/issues.md`) of recurring issues, noise, human-only catches, and stale rules, then opens a PR proposing `REVIEW.md` changes. Every rule cites the PRs that justify it, and the job never writes to your default branch. Across several repos, patterns that recur in more than one are proposed against the kit's base prompt instead. Run it locally with `/review-retro <owner/repo>`, or adopt it in CI with a caller that pins `@v1` and owns the schedule: [`plugins/review-retro/templates/caller-review-retro.yml`](plugins/review-retro/templates/caller-review-retro.yml). Setup, token scopes, scheduling, and cost: [`plugins/review-retro/README.md`](plugins/review-retro/README.md).
 
 ### PR Channels server (`pr-channel`): coming
 
@@ -124,6 +124,7 @@ A prompt change is a release. Every push to `main` runs [`ci.yml`](.github/workf
 ```
 .github/workflows/review.yml        reusable workflow (workflow_call)
 .github/workflows/ac-check.yml      reusable AC check (workflow_call), see plugins/ac-check
+.github/workflows/review-retro.yml  reusable review retro (workflow_call), see plugins/review-retro
 .github/workflows/ci.yml            reviews the fixture PR on every push to main
 .github/workflows/release.yml       moves vX when vX.Y.Z is tagged
 .github/workflows/credential-check.yml  manual: no secrets must fail clearly

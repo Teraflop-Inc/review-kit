@@ -18,8 +18,8 @@
     {
       "name": "review-retro",
       "source": "./plugins/review-retro",
-      "description": "Placeholder (ENG2-1655): post-merge retro on what review caught and missed.",
-      "version": "0.0.0"
+      "description": "Mine past PR review threads into a per-repo knowledge base and open a PR proposing cited REVIEW.md changes (ENG2-1655).",
+      "version": "1.0.0"
     },
     {
       "name": "pr-channel",
