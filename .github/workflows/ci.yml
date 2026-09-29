@@ -47,7 +47,10 @@ jobs:
       pr_number: 2
       dry_run: true
       auth_method: ${{ inputs.auth_method || 'auto' }}
-    secrets: inherit
+    # Pass secrets by name, as the caller templates do, so CI exercises the path callers use.
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
   check-findings:
     needs: review-fixture
