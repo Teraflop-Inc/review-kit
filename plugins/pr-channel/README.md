@@ -36,7 +36,7 @@ webhook at all, and it is the only process holding the GitHub token.
 **1. Install the plugin** (once per machine):
 
 ```bash
-claude plugin marketplace add Teraflop-Inc/review-kit
+claude plugin marketplace add aowen14/review-kit
 claude plugin install pr-channel@review-kit
 ```
 
