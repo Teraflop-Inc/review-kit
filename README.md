@@ -58,7 +58,7 @@ Optional: paste [`templates/CLAUDE.fyi-snippet.md`](templates/CLAUDE.fyi-snippet
 
 ### What the workflow does
 
-- Loads [`prompts/base-review.md`](prompts/base-review.md) from review-kit at the exact ref you pinned, then appends your repo's `REVIEW.md` if present. Your `CLAUDE.md` is picked up from the checkout. Change `REVIEW.md` and the next run changes with it.
+- Loads [`prompts/base-review.md`](prompts/base-review.md) from review-kit at the exact ref you pinned, then appends your repo's `REVIEW.md` if present. `REVIEW.md` is read from the PR's base branch, so a PR cannot loosen its own review rules (the PR that first adds it uses its own copy). Your `CLAUDE.md` is picked up from the checkout. Change `REVIEW.md` and the next run changes with it.
 - Installs `pr-review-toolkit` through the action's `plugin_marketplaces` and `plugins` inputs, so its agents are available to the reviewer through the Task tool.
 - On PRs labeled `fyi`, reports Important findings only and posts no nits. The label is read when the job starts, so labeling right after opening still counts.
 - Skips draft PRs (they are reviewed on "ready for review") and PRs whose files all match `skip_paths`.

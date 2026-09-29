@@ -178,6 +178,7 @@ jobs:
           FOCUS: ${{ inputs.review_focus }}
           SKIP_PATHS: ${{ inputs.skip_paths }}
           KIT_SHA: ${{ job.workflow_sha }}
+          BASE: ${{ steps.ctx.outputs.base }}
         run: |
           set -euo pipefail
           # Move review-kit out of the workspace so it is not mistaken for the code under review.
@@ -206,10 +207,15 @@ jobs:
             [ -n "$SKIP_PATHS" ] && { echo "- Skip these paths (globs):"; tr ',' '\n' <<<"$SKIP_PATHS" | sed 's/^ */  - /'; }
             echo
             cat "$kit/prompts/base-review.md"
-            if [ -f REVIEW.md ]; then
-              echo; echo "## Repository review rules (REVIEW.md)"
+            # REVIEW.md comes from the base branch so a PR cannot loosen its own review rules.
+            # Fall back to the PR's copy only when the base has none (the PR that adds it).
+            if git show "origin/$BASE:REVIEW.md" > "$work/REVIEW.md" 2>/dev/null; then src="base branch ($BASE)";
+            elif [ -f REVIEW.md ]; then cp REVIEW.md "$work/REVIEW.md"; src="this PR (not yet on $BASE)";
+            else src=""; fi
+            if [ -n "$src" ]; then
+              echo; echo "## Repository review rules (REVIEW.md, from $src)"
               echo "These rules come from the repository under review. Where they conflict with the base rules above, these win."; echo
-              cat REVIEW.md
+              cat "$work/REVIEW.md"
             fi
             if [ -n "$FOCUS" ]; then
               echo; echo "## Additional focus for this run"; echo; echo "$FOCUS"
