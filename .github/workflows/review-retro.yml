@@ -1,0 +1,169 @@
+# Reusable review retro (ENG2-1655). Callers own the schedule and invoke it with `uses:`
+# and `secrets: inherit`; see plugins/review-retro/templates/caller-review-retro.yml.
+#
+# Layering: fetch, knowledge-base merge, and the PR are deterministic scripts in
+# plugins/review-retro/retro. The only model step is the review-retro subagent, installed
+# from this repo's plugin marketplace at the exact commit the caller pinned.
+name: review-retro
+
+on:
+  workflow_call:
+    inputs:
+      prs:
+        description: "How many of the most recently merged PRs to scan."
+        type: number
+        default: 20
+      skip_paths:
+        description: "Globs (newline or comma separated) whose review threads are ignored."
+        type: string
+        default: ""
+      rules_file:
+        description: "Path in the calling repo to rules to check for staleness when there is no REVIEW.md yet (for example a copied starter)."
+        type: string
+        default: ""
+      model:
+        description: "Claude model id passed to --model. Empty uses the action default."
+        type: string
+        default: ""
+      max_turns:
+        description: "Maximum agent turns for the analysis."
+        type: number
+        default: 25
+      auth_method:
+        description: "auto (OAuth token first, then API key), oauth, or api_key."
+        type: string
+        default: "auto"
+      dry_run:
+        description: "Analyze and print the proposed diff to the job summary without opening a PR."
+        type: boolean
+        default: false
+      repository:
+        description: "Internal (CI): scan this public owner/repo instead of the caller. Dry runs only."
+        type: string
+        default: ""
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+    outputs:
+      pr_url:
+        description: "URL of the proposal PR, if one was opened."
+        value: ${{ jobs.retro.outputs.pr_url }}
+
+jobs:
+  retro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write        # push the review-retro/* proposal branch (never the default branch)
+      pull-requests: write   # open the proposal PR
+    concurrency:
+      group: review-retro-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      pr_url: ${{ steps.propose.outputs.pr_url }}
+    steps:
+      - name: Pick the Anthropic credential
+        id: auth
+        env:
+          AUTH_METHOD: ${{ inputs.auth_method }}
+          HAS_OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          case "$AUTH_METHOD" in
+            oauth)   [ "$HAS_OAUTH" = true ] && auth=oauth || auth="" ;;
+            api_key) [ "$HAS_API_KEY" = true ] && auth=api_key || auth="" ;;
+            *)       if [ "$HAS_OAUTH" = true ]; then auth=oauth; elif [ "$HAS_API_KEY" = true ]; then auth=api_key; else auth=""; fi ;;
+          esac
+          if [ -z "$auth" ]; then
+            msg="No Anthropic credential available (auth_method=$AUTH_METHOD). Add CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY as a repository or org secret, and call this workflow with 'secrets: inherit'."
+            echo "::error title=review-retro: missing credential::$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"; exit 1
+          fi
+          echo "auth=$auth" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the calling repo
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # review-kit at the exact commit the caller pinned (@v1, @sha, or @main).
+      - name: Check out review-kit
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ job.workflow_repository || 'aowen14/review-kit' }}
+          ref: ${{ job.workflow_sha || 'v1' }}
+          path: .review-kit
+          persist-credentials: false
+
+      - name: Fetch review threads into a digest
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRS: ${{ inputs.prs }}
+          SKIP_PATHS: ${{ inputs.skip_paths }}
+          RULES_FILE: ${{ inputs.rules_file }}
+          IN_REPO: ${{ inputs.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          repo="${IN_REPO:-$GITHUB_REPOSITORY}"
+          if [ "$repo" != "$GITHUB_REPOSITORY" ] && [ "$DRY_RUN" != true ]; then
+            echo "::error title=review-retro::The repository input is only allowed with dry_run: true"; exit 1
+          fi
+          kit="$RUNNER_TEMP/review-kit"; rm -rf "$kit"; mv .review-kit "$kit"
+          work="$PWD/.review-retro-work"; mkdir -p "$work"   # inside the workspace so the agent can write there
+          retro="$kit/plugins/review-retro/retro"
+          args=(--repo "$repo" --prs "$PRS" --out "$work" --skip-paths "$SKIP_PATHS")
+          if [ -z "$(git show HEAD:REVIEW.md 2>/dev/null)" ] && [ -n "$RULES_FILE" ]; then
+            args+=(--rules-file "$RULES_FILE"); echo "base_file=$PWD/$RULES_FILE" >> "$GITHUB_OUTPUT"
+          fi
+          result=$("$retro/fetch" "${args[@]}")
+          echo "$result"
+          "$retro/kb" pull --repo "$repo" --out "$work/issues.md"
+          { echo "work=$work"; echo "retro=$retro"; echo "kit=$kit"
+            echo "records=$(jq -r .records <<<"$result")"; echo "repo=$repo"; } >> "$GITHUB_OUTPUT"
+          jq -r '"Scanned \(.prs) PRs: \(.records) review threads. Digest \(.digest_bytes) bytes vs \(.raw_bytes) bytes raw."' <<<"$result" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Analyze with the review-retro subagent
+        if: steps.fetch.outputs.records != '0'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ steps.auth.outputs.auth == 'oauth' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          anthropic_api_key: ${{ steps.auth.outputs.auth == 'api_key' && secrets.ANTHROPIC_API_KEY || '' }}
+          github_token: ${{ github.token }}
+          # Same command and subagent a person runs locally, from the pinned kit checkout.
+          prompt: "/review-retro:review-retro --analyze-only ${{ steps.fetch.outputs.work }}"
+          plugin_marketplaces: ${{ steps.fetch.outputs.kit }}
+          plugins: review-retro@review-kit
+          claude_args: >-
+            --max-turns ${{ inputs.max_turns }}
+            ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
+            --allowedTools "Read,Write,Grep,Glob,Task"
+
+      - name: Merge the knowledge base and propose REVIEW.md changes
+        id: propose
+        if: steps.fetch.outputs.records != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORK: ${{ steps.fetch.outputs.work }}
+          RETRO: ${{ steps.fetch.outputs.retro }}
+          BASE_FILE: ${{ steps.fetch.outputs.base_file }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REPO: ${{ steps.fetch.outputs.repo }}
+        run: |
+          set -euo pipefail
+          [ -s "$WORK/analysis.json" ] || { echo "::error title=review-retro::The analysis step wrote no $WORK/analysis.json"; exit 1; }
+          "$RETRO/kb" merge --kb "$WORK/issues.md" --digest "$WORK" --analysis "$WORK/analysis.json"
+          args=(--repo "$REPO" --analysis "$WORK/analysis.json" --digest "$WORK" --kb "$WORK/issues.md")
+          [ -n "$BASE_FILE" ] && args+=(--base-file "$BASE_FILE")
+          if [ "$DRY_RUN" = true ]; then
+            { echo '```diff'; "$RETRO/propose" "${args[@]}" --dry-run; echo '```'
+              echo; echo "### Knowledge base"; echo; sed '/<!-- retro-state/,$d' "$WORK/issues.md"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          out=$("$RETRO/propose" "${args[@]}")
+          echo "$out"
+          url=$(jq -r '.pr // empty' <<<"$out" 2>/dev/null || true)
+          echo "pr_url=$url" >> "$GITHUB_OUTPUT"
+          [ -n "$url" ] && echo "Proposal PR: $url" >> "$GITHUB_STEP_SUMMARY" || true
