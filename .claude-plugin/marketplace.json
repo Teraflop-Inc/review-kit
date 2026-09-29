@@ -24,8 +24,8 @@
     {
       "name": "pr-channel",
       "source": "./plugins/pr-channel",
-      "description": "Placeholder (ENG2-1657): Channels server that streams PR review events into Claude Code.",
-      "version": "0.0.0"
+      "description": "Channels server that streams GitHub PR review events into a running Claude Code session: signed webhooks, per-PR subscriptions, one session answers each event (ENG2-1657).",
+      "version": "0.1.0"
     }
   ]
 }
