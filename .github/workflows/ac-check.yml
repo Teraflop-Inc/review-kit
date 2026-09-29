@@ -1,0 +1,177 @@
+# Reusable acceptance-criteria check (ENG2-1656). Callers invoke it with `uses:` and
+# `secrets: inherit`; see plugins/ac-check/templates/caller-ac-check.yml.
+#
+# Layering: issue resolution, the Linear fetch, AC parsing, verdict validation, and the
+# comment upsert are deterministic scripts in plugins/ac-check/ac. The only model step is
+# the evaluation, run through the same /ac-check command a person runs locally, installed
+# from this repo's plugin marketplace at the exact commit the caller pinned.
+# Report only: nothing here changes the Linear issue's status or checkboxes.
+name: ac-check
+
+on:
+  workflow_call:
+    inputs:
+      ac_heading:
+        description: "Heading whose checkboxes are the acceptance criteria. Without it, every checkbox counts."
+        type: string
+        default: "Acceptance criteria"
+      team_prefixes:
+        description: "Comma-separated Linear team keys to recognize in branch/title/body (for example ENG2,ENG). Empty: every team the Linear key can see."
+        type: string
+        default: ""
+      linear_comment:
+        description: "Also mirror the result as a comment on the Linear issue (needs a key that can create comments)."
+        type: boolean
+        default: false
+      model:
+        description: "Claude model id passed to --model. Empty uses the action default."
+        type: string
+        default: ""
+      max_turns:
+        description: "Maximum agent turns for the evaluation."
+        type: number
+        default: 40
+      auth_method:
+        description: "auto (OAuth token first, then API key), oauth, or api_key."
+        type: string
+        default: "auto"
+    secrets:
+      LINEAR_API_KEY:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+    outputs:
+      comment_url:
+        description: "URL of the PR comment that was created or updated."
+        value: ${{ jobs.ac-check.outputs.comment_url }}
+      skipped:
+        description: "Non-empty reason when the check was skipped."
+        value: ${{ jobs.ac-check.outputs.skipped }}
+
+jobs:
+  ac-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write   # the one report comment
+    concurrency:
+      group: ac-check-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    outputs:
+      comment_url: ${{ steps.post.outputs.comment_url }}
+      skipped: ${{ steps.prep.outputs.skipped || steps.ctx.outputs.skipped }}
+    steps:
+      - name: Resolve PR context and credentials
+        id: ctx
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          AUTH_METHOD: ${{ inputs.auth_method }}
+          HAS_OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAS_LINEAR: ${{ secrets.LINEAR_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          skip() { echo "skipped=$1" >> "$GITHUB_OUTPUT"; echo "::notice title=AC check skipped::$1"; echo "AC check skipped: $1" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          [ -n "$PR" ] || { echo "::error title=ac-check::Call this workflow from a pull_request event."; exit 1; }
+          # Fork PRs never receive secrets; skip before the credential checks so this is not an error.
+          [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ] || skip "PR is from a fork ($HEAD_REPO); fork PRs do not receive secrets."
+          [ "$IS_DRAFT" != true ] || skip "PR is a draft. It is checked when marked ready for review."
+          case "$AUTH_METHOD" in
+            oauth)   [ "$HAS_OAUTH" = true ] && auth=oauth || auth="" ;;
+            api_key) [ "$HAS_API_KEY" = true ] && auth=api_key || auth="" ;;
+            *)       if [ "$HAS_OAUTH" = true ]; then auth=oauth; elif [ "$HAS_API_KEY" = true ]; then auth=api_key; else auth=""; fi ;;
+          esac
+          fail() { echo "::error title=ac-check: missing secret::$1"; echo "$1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [ -n "$auth" ] || fail "No Anthropic credential available (auth_method=$AUTH_METHOD). Add CLAUDE_CODE_OAUTH_TOKEN (from 'claude setup-token') or ANTHROPIC_API_KEY as a repository or org secret, and call this workflow with 'secrets: inherit'."
+          [ "$HAS_LINEAR" = true ] || fail "LINEAR_API_KEY is not available. Add it as a repository or org secret, and call this workflow with 'secrets: inherit'."
+          { echo "auth=$auth"; echo "pr=$PR"; echo "skipped="; } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the PR
+        if: steps.ctx.outputs.skipped == ''
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0   # history so the evaluator can use git log/show/diff
+          persist-credentials: false
+
+      # review-kit at the exact commit the caller pinned (@v1, @sha, or @main).
+      - name: Check out review-kit
+        if: steps.ctx.outputs.skipped == ''
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ job.workflow_repository || 'aowen14/review-kit' }}
+          ref: ${{ job.workflow_sha || 'v1' }}
+          path: .review-kit
+          persist-credentials: false
+
+      - name: Resolve the Linear issue and parse its acceptance criteria
+        id: prep
+        if: steps.ctx.outputs.skipped == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          HEADING: ${{ inputs.ac_heading }}
+          TEAMS: ${{ inputs.team_prefixes }}
+        run: |
+          set -euo pipefail
+          # Move review-kit out of the workspace so it is not mistaken for the code under check.
+          kit="$RUNNER_TEMP/review-kit"; rm -rf "$kit"; mv .review-kit "$kit"
+          work="$PWD/.ac-check-work"   # inside the workspace so the agent can write verdicts there
+          set +e
+          summary=$("$kit/plugins/ac-check/ac/prepare" "$GITHUB_REPOSITORY#$PR" --out "$work" \
+                    --repo-dir "$PWD" --heading "$HEADING" --teams "$TEAMS")
+          code=$?
+          set -e
+          echo "$summary"
+          if [ "$code" = 4 ]; then
+            msg=$(jq -r .error <<<"$summary")
+            echo "skipped=$msg" >> "$GITHUB_OUTPUT"; echo "::notice title=AC check skipped::$msg"
+            echo "AC check skipped: $msg" >> "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          [ "$code" = 0 ] || exit "$code"
+          { echo "skipped="; echo "work=$work"; echo "kit=$kit"
+            echo "criteria=$(jq -r .criteria <<<"$summary")"; } >> "$GITHUB_OUTPUT"
+          jq -r '"Linear issue \(.issue) (from \(.issue_source)): \(.criteria) criteria (\(.criteria_source))."' <<<"$summary" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Evaluate each criterion
+        if: steps.ctx.outputs.skipped == '' && steps.prep.outputs.skipped == '' && steps.prep.outputs.criteria != '0'
+        uses: anthropics/claude-code-action@v1
+        env:
+          AC_CHECK_EVALUATE_ONLY: "1"   # ac/post refuses to run; the next step is the only writer
+        with:
+          claude_code_oauth_token: ${{ steps.ctx.outputs.auth == 'oauth' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          anthropic_api_key: ${{ steps.ctx.outputs.auth == 'api_key' && secrets.ANTHROPIC_API_KEY || '' }}
+          github_token: ${{ github.token }}
+          # Same command and prompt a person runs locally, from the pinned kit checkout.
+          prompt: "/ac-check:ac-check --evaluate-only ${{ steps.prep.outputs.work }}"
+          plugin_marketplaces: ${{ steps.prep.outputs.kit }}
+          plugins: ac-check@review-kit
+          claude_args: >-
+            --max-turns ${{ inputs.max_turns }}
+            ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
+            --allowedTools "Read,Write,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git grep:*)"
+            --disallowedTools "Bash(gh:*),Bash(curl:*),mcp__github_inline_comment__create_inline_comment"
+
+      - name: Post or update the report comment
+        id: post
+        if: steps.ctx.outputs.skipped == '' && steps.prep.outputs.skipped == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          WORK: ${{ steps.prep.outputs.work }}
+          KIT: ${{ steps.prep.outputs.kit }}
+          MIRROR: ${{ inputs.linear_comment }}
+        run: |
+          set -euo pipefail
+          args=("$WORK"); [ "$MIRROR" = true ] && args+=(--linear-comment)
+          out=$("$KIT/plugins/ac-check/ac/post" "${args[@]}")
+          echo "$out"
+          url=$(jq -r .comment <<<"$out")
+          echo "comment_url=$url" >> "$GITHUB_OUTPUT"
+          jq -r '"AC check \(.action): \(.comment)" + (if .tally then "\n\n" + (.tally | to_entries | map("\(.value) \(.key)") | join(" · ")) else "" end)' <<<"$out" >> "$GITHUB_STEP_SUMMARY"

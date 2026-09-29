@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""ac/prepare: gather everything the AC check needs for one PR. Deterministic, no LLM.
+
+Resolves the Linear issue (explicit, else branch name, else PR title, else PR body), fetches its
+description, parses the acceptance criteria, saves the PR diff, and makes sure a checkout of the
+PR head exists so the evaluator can read beyond the diff.
+
+Usage:
+  ac/prepare <pr-url | owner/repo#N | N> [--issue ENG2-123] [--out DIR]
+             [--heading "Acceptance criteria"] [--teams ENG2,ENG]
+             [--repo-dir PATH] [--issue-json FILE]
+
+Writes DIR/context.json and DIR/pr.diff, and prints a one-line JSON summary. Exit codes:
+  0  ready (criteria may be empty; `ac/post` then posts the "no ACs" comment)
+  3  no Linear issue data: LINEAR_API_KEY is unset and no --issue-json. The summary names the
+     resolved identifier (`need_issue`) so the caller can fetch it another way (e.g. Linear MCP)
+  4  no Linear issue ID found for this PR
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ac import (DEFAULT_HEADING, AcError, gh, gh_json, linear_issue, linear_key,  # noqa: E402
+                 linear_team_keys, parse_criteria, parse_pr_ref, resolve_issue_candidates)
+
+
+def git(args, cwd=None, check=True):
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise AcError(f"git {' '.join(args[:2])} failed: {p.stderr.strip()[:300]}")
+    return p.stdout.strip()
+
+
+def ensure_checkout(repo, pr, sha, out, repo_dir=None):
+    """Return a directory whose working tree is the PR head. Reuses cwd or --repo-dir when it already is."""
+    for cand in [repo_dir, os.getcwd()]:
+        if cand and git(["rev-parse", "HEAD"], cwd=cand, check=False) == sha:
+            return os.path.abspath(cand)
+    if repo_dir:
+        raise AcError(f"--repo-dir {repo_dir} is not at the PR head {sha[:7]}")
+    dest = os.path.join(out, "repo")
+    if not os.path.isdir(os.path.join(dest, ".git")):
+        gh(["repo", "clone", repo, dest, "--", "--filter=blob:none", "--no-checkout", "--quiet"])
+    if subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=dest, capture_output=True).returncode != 0:
+        git(["fetch", "--quiet", "origin", f"pull/{pr}/head"], cwd=dest)
+    git(["checkout", "--quiet", "--detach", sha], cwd=dest)
+    return os.path.abspath(dest)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("pr")
+    ap.add_argument("--issue", help="Linear identifier; skips resolution from branch/title/body")
+    ap.add_argument("--out", help="work dir (default .ac-check/<owner>__<name>-<N>)")
+    ap.add_argument("--heading", default=DEFAULT_HEADING)
+    ap.add_argument("--teams", default="", help="comma-separated Linear team keys to recognize (default: all teams the key can see)")
+    ap.add_argument("--repo-dir", help="existing checkout of the PR head (CI)")
+    ap.add_argument("--issue-json", help="issue fetched elsewhere: {identifier,title,url,description}")
+    ap.add_argument("--no-checkout", action="store_true", help="skip making a checkout (tests)")
+    a = ap.parse_args()
+
+    repo, pr = parse_pr_ref(a.pr)
+    out = os.path.abspath(a.out or os.path.join(".ac-check", f"{repo.replace('/', '__')}-{pr}"))
+    os.makedirs(out, exist_ok=True)
+
+    meta = gh_json(["pr", "view", str(pr), "-R", repo, "--json",
+                    "number,url,title,body,headRefName,headRefOid,baseRefName,baseRefOid,files"])
+    with open(os.path.join(out, "pr.diff"), "w") as f:
+        f.write(gh(["pr", "diff", str(pr), "-R", repo]))
+    changed = [f["path"] for f in meta.get("files") or []]
+
+    ctx = {"repo": repo, "pr": pr, "pr_url": meta["url"], "title": meta["title"],
+           "branch": meta["headRefName"], "head_sha": meta["headRefOid"], "base": meta["baseRefName"],
+           "base_sha": meta.get("baseRefOid"), "files": changed, "heading": a.heading,
+           "diff": os.path.join(out, "pr.diff"), "issue": None, "criteria": [], "criteria_source": "none"}
+
+    def finish(code, **extra):
+        with open(os.path.join(out, "context.json"), "w") as f:
+            json.dump(ctx, f, indent=2)
+        print(json.dumps({"out": out, "repo": repo, "pr": pr,
+                          "issue": (ctx["issue"] or {}).get("identifier"),
+                          "criteria": len(ctx["criteria"]), "criteria_source": ctx["criteria_source"],
+                          "repo_dir": ctx.get("repo_dir"), **extra}))
+        sys.exit(code)
+
+    key = linear_key()
+    if a.issue_json:
+        with open(a.issue_json) as f:
+            issue = json.load(f)
+        issue["identifier"] = issue["identifier"].upper()
+        source = "issue-json"
+    else:
+        teams = {t.strip().upper() for t in a.teams.split(",") if t.strip()} or None
+        if a.issue:
+            cands = [(a.issue.upper(), "explicit")]
+        else:
+            if teams is None and key:
+                teams = linear_team_keys(key) or None
+            cands = resolve_issue_candidates(meta["headRefName"], meta["title"], meta["body"], teams)
+        if not cands:
+            finish(4, error="No Linear issue ID in the branch name, PR title, or PR body. Pass one explicitly.")
+        if not key:
+            ctx["issue_candidates"] = [c for c, _ in cands]
+            finish(3, need_issue=cands[0][0], source=cands[0][1],
+                   error="LINEAR_API_KEY is not set; fetch the issue another way and pass --issue-json")
+        issue = source = None
+        for ident, src in cands:
+            issue = linear_issue(ident, key)
+            if issue:
+                source = src
+                break
+        if not issue:
+            finish(4, error=f"None of {', '.join(c for c, _ in cands)} is a Linear issue this key can read.")
+
+    criteria, csrc = parse_criteria(issue.get("description") or "", a.heading)
+    ctx.update(issue={k: issue.get(k) for k in ("identifier", "title", "url")}, issue_source=source,
+               criteria=criteria, criteria_source=csrc)
+    if criteria and not a.no_checkout:
+        ctx["repo_dir"] = ensure_checkout(repo, pr, ctx["head_sha"], out, a.repo_dir)
+    elif a.repo_dir:
+        ctx["repo_dir"] = os.path.abspath(a.repo_dir)
+    finish(0, issue_source=source)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except AcError as e:
+        print(f"ac-check: {e}", file=sys.stderr)
+        sys.exit(1)
