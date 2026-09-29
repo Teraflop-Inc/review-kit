@@ -189,6 +189,16 @@ class UpsertTests(unittest.TestCase):
         self.assertIn("POST", calls[1][0])
 
 
+class EvaluateOnlyGuardTests(unittest.TestCase):
+    def test_post_refuses_during_evaluation(self):
+        import subprocess
+        env = {**os.environ, "AC_CHECK_EVALUATE_ONLY": "1"}
+        p = subprocess.run([sys.executable, os.path.join(AC, "post"), tempfile.mkdtemp()],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("disabled during evaluation", p.stderr)
+
+
 class ReportOnlyTests(unittest.TestCase):
     def test_only_linear_writes_are_comments(self):
         src = ""

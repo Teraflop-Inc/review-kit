@@ -142,6 +142,8 @@ jobs:
       - name: Evaluate each criterion
         if: steps.ctx.outputs.skipped == '' && steps.prep.outputs.skipped == '' && steps.prep.outputs.criteria != '0'
         uses: anthropics/claude-code-action@v1
+        env:
+          AC_CHECK_EVALUATE_ONLY: "1"   # ac/post refuses to run; the next step is the only writer
         with:
           claude_code_oauth_token: ${{ steps.ctx.outputs.auth == 'oauth' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           anthropic_api_key: ${{ steps.ctx.outputs.auth == 'api_key' && secrets.ANTHROPIC_API_KEY || '' }}
@@ -154,6 +156,7 @@ jobs:
             --max-turns ${{ inputs.max_turns }}
             ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
             --allowedTools "Read,Write,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git grep:*)"
+            --disallowedTools "Bash(gh:*),Bash(curl:*),mcp__github_inline_comment__create_inline_comment"
 
       - name: Post or update the report comment
         id: post

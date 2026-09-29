@@ -33,6 +33,11 @@ def main():
     ap.add_argument("--linear-comment", action="store_true", help="also mirror the result as a comment on the Linear issue")
     ap.add_argument("--dry-run", action="store_true", help="print the comment instead of posting")
     a = ap.parse_args()
+    # The workflow sets this around the Claude step: evaluation writes verdicts.json, and only the
+    # workflow's own post step writes to GitHub or Linear. The slash command grants Bash, so the
+    # model could otherwise post mid-evaluation.
+    if os.environ.get("AC_CHECK_EVALUATE_ONLY"):
+        raise AcError("ac/post is disabled during evaluation (AC_CHECK_EVALUATE_ONLY); write verdicts.json and stop")
 
     with open(os.path.join(a.dir, "context.json")) as f:
         ctx = json.load(f)
