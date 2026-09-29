@@ -66,6 +66,12 @@ Optional: paste [`templates/CLAUDE.fyi-snippet.md`](templates/CLAUDE.fyi-snippet
 - Posts as `github-actions[bot]` with the workflow token. No GitHub App install and no `id-token: write` are needed; permissions are `contents: read` and `pull-requests: write`.
 - Fails with a clear error if neither `CLAUDE_CODE_OAUTH_TOKEN` nor `ANTHROPIC_API_KEY` is available.
 
+### Troubleshooting
+
+- **"No Anthropic credential available"**: add the secret, then push a new commit (or close and reopen the PR). Re-running an old run can keep the secrets it started with, so a secret added afterwards may not reach it.
+- **Fork PR skipped**: expected. Fork PRs never receive secrets. Push the branch to the base repo to get a review.
+- **No review on a draft**: expected. Mark the PR ready for review.
+
 ### Inputs
 
 All optional. Pass them under `with:` in your caller.

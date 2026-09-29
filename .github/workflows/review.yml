@@ -153,7 +153,7 @@ jobs:
         with:
           repository: ${{ steps.ctx.outputs.repo }}
           ref: ${{ steps.ctx.outputs.head_sha }}
-          fetch-depth: 1
+          fetch-depth: 0   # full history so `git diff origin/<base>...HEAD` has a merge base
           persist-credentials: false
 
       # Check out review-kit at the exact commit the caller pinned (@v1, @sha, or @main).
