@@ -1,0 +1,10 @@
+{
+  "name": "review-retro",
+  "description": "Mines past PR review threads into a per-repo knowledge base of recurring issue types and opens a PR proposing REVIEW.md changes, each citing the PRs that justify it.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Teraflop",
+    "email": "alex@teraflop.io"
+  },
+  "keywords": ["code-review", "pull-request", "retro", "review-md", "knowledge-base"]
+}
