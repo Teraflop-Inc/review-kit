@@ -12,7 +12,7 @@ on:
         default: auto
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write  # review.yml requests it; dry runs post nothing
 jobs:
   review-fixture:
     uses: ./.github/workflows/review.yml
