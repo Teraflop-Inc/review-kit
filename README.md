@@ -88,9 +88,9 @@ All optional. Pass them under `with:` in your caller.
 
 Plugins in this repo's marketplace, installed with `/plugin marketplace add aowen14/review-kit`.
 
-### AC checker (`ac-check`): coming
+### AC checker (`ac-check`)
 
-Checks a PR against the acceptance criteria on its linked Linear ticket. Needs a Linear API key. Tracked in ENG2-1656.
+Checks a PR against the acceptance criteria on its linked Linear issue and posts one comment: a verdict per criterion (`met`, `partial`, `missing`, or `not verifiable from diff`), with `file:line` evidence for everything it calls met or partial. The issue is found from the branch name, PR title, or body. Re-runs edit the same comment, and it never changes the Linear issue (report only). Run it locally with `/ac-check <pr> [issue]`, or on every PR with a caller pinned to `@v1`: [`plugins/ac-check/templates/caller-ac-check.yml`](plugins/ac-check/templates/caller-ac-check.yml). Needs `LINEAR_API_KEY`. Setup, secrets, token scopes, and pinning: [`plugins/ac-check/README.md`](plugins/ac-check/README.md).
 
 ### Review retro (`review-retro`): coming
 
@@ -123,6 +123,7 @@ A prompt change is a release. Every push to `main` runs [`ci.yml`](.github/workf
 
 ```
 .github/workflows/review.yml        reusable workflow (workflow_call)
+.github/workflows/ac-check.yml      reusable AC check (workflow_call), see plugins/ac-check
 .github/workflows/ci.yml            reviews the fixture PR on every push to main
 .github/workflows/release.yml       moves vX when vX.Y.Z is tagged
 .github/workflows/credential-check.yml  manual: no secrets must fail clearly

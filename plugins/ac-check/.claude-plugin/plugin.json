@@ -1,0 +1,10 @@
+{
+  "name": "ac-check",
+  "description": "Checks a PR against its Linear issue's acceptance criteria and posts one report comment (met, partial, missing, or not verifiable from diff, with file:line evidence). Report only.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Teraflop",
+    "email": "alex@teraflop.io"
+  },
+  "keywords": ["code-review", "pull-request", "linear", "acceptance-criteria"]
+}

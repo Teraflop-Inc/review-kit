@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""ac/post: validate verdicts, render the report, and create or update the one PR comment.
+
+Deterministic, no LLM. Reads DIR/context.json from `ac/prepare` and DIR/verdicts.json from the
+evaluator. With no criteria it posts the short "no acceptance criteria" comment and exits 0.
+
+Usage:
+  ac/post DIR [--verdicts FILE] [--linear-comment] [--dry-run]
+
+verdicts.json:
+  {"criteria": [{"id": 1, "verdict": "met|partial|missing|not verifiable from diff",
+                 "reason": "one line", "evidence": ["path/to/file.py:42", "other.md:10-14"]}],
+   "summary": "optional one or two sentences"}
+
+Every criterion ends up with exactly one of the four verdicts. A met or partial without a
+resolvable file:line is downgraded to "not verifiable from diff" and the comment says why.
+Prints {"comment": url, "action": "created|updated", "tally": {...}}.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ac import (AcError, linear_header, linear_key, linear_upsert_comment, normalize_verdicts,  # noqa: E402
+                 render_github, render_linear, tally, upsert_pr_comment)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("dir")
+    ap.add_argument("--verdicts", help="default DIR/verdicts.json")
+    ap.add_argument("--linear-comment", action="store_true", help="also mirror the result as a comment on the Linear issue")
+    ap.add_argument("--dry-run", action="store_true", help="print the comment instead of posting")
+    a = ap.parse_args()
+
+    with open(os.path.join(a.dir, "context.json")) as f:
+        ctx = json.load(f)
+    if not ctx.get("issue"):
+        raise AcError("context.json has no Linear issue; run ac/prepare first")
+
+    rows = summary = None
+    problems = []
+    if ctx["criteria"]:
+        path = a.verdicts or os.path.join(a.dir, "verdicts.json")
+        if not os.path.exists(path):
+            raise AcError(f"{path} not found; the evaluation step did not write verdicts")
+        with open(path) as f:
+            raw = json.load(f)
+        rows, problems = normalize_verdicts(ctx["criteria"], raw, ctx.get("repo_dir"), set(ctx.get("files") or []))
+        summary = raw.get("summary") if isinstance(raw, dict) else None
+        for p in problems:
+            print(f"ac-check: {p}", file=sys.stderr)
+
+    body = render_github(ctx, rows, summary, problems)
+    result = {"tally": tally(rows) if rows else None, "criteria": len(ctx["criteria"])}
+    if a.dry_run:
+        print(body)
+        print(json.dumps({**result, "action": "dry-run"}), file=sys.stderr)
+        return
+    action, url = upsert_pr_comment(ctx["repo"], ctx["pr"], body)
+    result.update(action=action, comment=url)
+    if a.linear_comment:
+        if not linear_key():
+            raise AcError("--linear-comment needs LINEAR_API_KEY")
+        la, lurl = linear_upsert_comment(ctx["issue"]["identifier"], linear_header(ctx),
+                                         render_linear(ctx, rows, summary, url))
+        result.update(linear_action=la, linear_comment=lurl)
+    with open(os.path.join(a.dir, "result.json"), "w") as f:
+        json.dump(result, f, indent=2)
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except AcError as e:
+        print(f"ac-check: {e}", file=sys.stderr)
+        sys.exit(1)
