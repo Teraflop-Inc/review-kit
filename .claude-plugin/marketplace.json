@@ -12,8 +12,8 @@
     {
       "name": "ac-check",
       "source": "./plugins/ac-check",
-      "description": "Placeholder (ENG2-1656): check a PR against its Linear ticket's acceptance criteria.",
-      "version": "0.0.0"
+      "description": "Check a PR against its Linear issue's acceptance criteria and post one report comment with file:line evidence; report only (ENG2-1656).",
+      "version": "1.0.0"
     },
     {
       "name": "review-retro",
