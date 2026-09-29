@@ -1,7 +1,268 @@
+# Reusable PR review workflow. Callers invoke it with `uses:` and `secrets: inherit`.
+# See templates/caller-review.yml for the caller and README.md for setup.
+#
+# Layering: mechanics (triggers, fetching, fork/secret guards, posting) live here.
+# Judgment lives in prompts/base-review.md plus the caller's REVIEW.md and CLAUDE.md.
 name: review
-on: workflow_call
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: "Claude model id passed to --model. Empty uses the action default."
+        type: string
+        default: ""
+      max_turns:
+        description: "Maximum agent turns (--max-turns)."
+        type: number
+        default: 40
+      review_focus:
+        description: "Free text appended to the review prompt."
+        type: string
+        default: ""
+      skip_paths:
+        description: "Globs (newline or comma separated) to exclude from review. If every changed file matches, the review is skipped."
+        type: string
+        default: ""
+      auth_method:
+        description: "auto (OAuth token first, then API key), oauth, or api_key."
+        type: string
+        default: "auto"
+      pr_number:
+        description: "Internal (CI): review this PR number instead of the triggering event's PR."
+        type: number
+        default: 0
+      repository:
+        description: "Internal (CI): owner/repo that pr_number belongs to."
+        type: string
+        default: ""
+      dry_run:
+        description: "Internal (CI): do not post anything; return findings as the `findings` output."
+        type: boolean
+        default: false
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+    outputs:
+      findings:
+        description: "JSON findings (dry_run only)."
+        value: ${{ jobs.review.outputs.findings }}
+      skipped:
+        description: "Non-empty reason when the review was skipped."
+        value: ${{ jobs.review.outputs.skipped }}
+
 jobs:
-  placeholder:
+  # Fork PRs get no secrets and a read-only token under `pull_request`, so the
+  # review job cannot comment on them. The caller also listens on
+  # `pull_request_target` (opened only) purely so this job can post a notice.
+  # It never checks out or runs PR code and uses no secrets.
+  fork-notice:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
-      - run: echo "placeholder"
+      - name: Explain why the review was skipped
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "$PR" -R "$REPO" --body "**Automated Claude review skipped.** This PR comes from a fork, and GitHub does not give workflows triggered by fork PRs access to repository secrets (the Anthropic credential the review needs). A maintainer can review it manually, or push the branch to this repository to get an automated review. (review-kit)"
+
+  review:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: review-kit-${{ inputs.repository || github.repository }}-${{ inputs.pr_number || github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    outputs:
+      findings: ${{ steps.claude.outputs.structured_output }}
+      skipped: ${{ steps.ctx.outputs.skipped }}
+    steps:
+      - name: Resolve PR context and guards
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_REPO: ${{ inputs.repository }}
+          IN_PR: ${{ inputs.pr_number }}
+          EV_PR: ${{ github.event.pull_request.number }}
+          EV_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SKIP_PATHS: ${{ inputs.skip_paths }}
+          AUTH_METHOD: ${{ inputs.auth_method }}
+          HAS_OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          repo="${IN_REPO:-$GITHUB_REPOSITORY}"
+          pr="$IN_PR"; [ "$pr" = "0" ] && pr="${EV_PR:-}"
+          skip() { echo "skipped=$1" >> "$GITHUB_OUTPUT"; echo "::notice title=Review skipped::$1"; echo "Review skipped: $1" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+
+          if [ -z "$pr" ]; then
+            echo "::error title=No pull request::review-kit needs a pull_request event, or pr_number and repository inputs."; exit 1
+          fi
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"; echo "pr=$pr" >> "$GITHUB_OUTPUT"
+
+          # Fork PRs never receive secrets. Skip before the credential check so this is not an error.
+          if [ -n "$EV_HEAD_REPO" ] && [ "$EV_HEAD_REPO" != "$GITHUB_REPOSITORY" ] && [ -z "$IN_REPO" ]; then
+            skip "PR is from a fork ($EV_HEAD_REPO); fork PRs do not receive repository secrets."
+          fi
+
+          # Pick the credential. Fail loudly if neither secret reached us.
+          case "$AUTH_METHOD" in
+            oauth)   [ "$HAS_OAUTH" = true ] && auth=oauth || auth="" ;;
+            api_key) [ "$HAS_API_KEY" = true ] && auth=api_key || auth="" ;;
+            *)       if [ "$HAS_OAUTH" = true ]; then auth=oauth; elif [ "$HAS_API_KEY" = true ]; then auth=api_key; else auth=""; fi ;;
+          esac
+          if [ -z "$auth" ]; then
+            msg="No Anthropic credential available (auth_method=$AUTH_METHOD). Add CLAUDE_CODE_OAUTH_TOKEN (from 'claude setup-token') or ANTHROPIC_API_KEY as a repository or org secret, and call this workflow with 'secrets: inherit'."
+            echo "::error title=review-kit: missing credential::$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"; exit 1
+          fi
+          echo "auth=$auth" >> "$GITHUB_OUTPUT"
+
+          meta=$(gh pr view "$pr" -R "$repo" --json isDraft,labels,files,headRefOid,baseRefName)
+          if [ "$(jq -r .isDraft <<<"$meta")" = true ]; then skip "PR is a draft. It will be reviewed when marked ready."; fi
+          echo "head_sha=$(jq -r .headRefOid <<<"$meta")" >> "$GITHUB_OUTPUT"
+          echo "base=$(jq -r .baseRefName <<<"$meta")" >> "$GITHUB_OUTPUT"
+          # Labels are read live (not from the event payload) so a label added right after opening still counts.
+          if jq -e '[.labels[].name] | index("fyi")' <<<"$meta" >/dev/null; then echo "fyi=true" >> "$GITHUB_OUTPUT"; else echo "fyi=false" >> "$GITHUB_OUTPUT"; fi
+
+          # skip_paths: skip entirely when every changed file matches a glob.
+          if [ -n "$SKIP_PATHS" ]; then
+            mapfile -t globs < <(tr ',' '\n' <<<"$SKIP_PATHS" | sed 's/^ *//;s/ *$//' | grep -v '^$' || true)
+            remaining=0
+            while read -r f; do
+              hit=0; for g in "${globs[@]}"; do [[ "$f" == $g ]] && { hit=1; break; }; done
+              [ $hit = 0 ] && remaining=$((remaining+1))
+            done < <(jq -r '.files[].path' <<<"$meta")
+            [ "$remaining" = 0 ] && skip "every changed file matches skip_paths."
+          fi
+          echo "skipped=" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the PR
+        if: steps.ctx.outputs.skipped == ''
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ steps.ctx.outputs.repo }}
+          ref: ${{ steps.ctx.outputs.head_sha }}
+          fetch-depth: 0   # full history so `git diff origin/<base>...HEAD` has a merge base
+          persist-credentials: false
+
+      # Check out review-kit at the exact commit the caller pinned (@v1, @sha, or @main).
+      - name: Check out review-kit
+        if: steps.ctx.outputs.skipped == ''
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ job.workflow_repository || 'aowen14/review-kit' }}
+          ref: ${{ job.workflow_sha || 'v1' }}
+          path: .review-kit
+          persist-credentials: false
+
+      - name: Assemble prompt
+        id: prompt
+        if: steps.ctx.outputs.skipped == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ steps.ctx.outputs.repo }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          FYI: ${{ steps.ctx.outputs.fyi }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          FOCUS: ${{ inputs.review_focus }}
+          SKIP_PATHS: ${{ inputs.skip_paths }}
+          KIT_SHA: ${{ job.workflow_sha }}
+          BASE: ${{ steps.ctx.outputs.base }}
+        run: |
+          set -euo pipefail
+          # Move review-kit out of the workspace so it is not mistaken for the code under review.
+          kit="$RUNNER_TEMP/review-kit"; rm -rf "$kit"; mv .review-kit "$kit"
+          work="$RUNNER_TEMP/review"; mkdir -p "$work"
+          gh pr diff "$PR" -R "$REPO" > "$work/pr.diff"
+          gh pr view "$PR" -R "$REPO" --json title,body,author,baseRefName,headRefName > "$work/pr.json"
+          f="$work/prompt.md"
+          {
+            echo "## Run context"
+            echo "- Repository: $REPO"
+            echo "- Pull request: #$PR"
+            echo "- PR metadata (title, body, author, branches): $work/pr.json"
+            echo "- Unified diff: $work/pr.diff (the PR checkout is the working directory)"
+            echo "- review-kit commit: ${KIT_SHA:-unknown}"
+            if [ "$FYI" = true ]; then
+              echo "- Mode: FYI. The PR is labeled \`fyi\`. Report Important findings only. Post no Nit comments and do not list nits in the summary."
+            else
+              echo "- Mode: normal."
+            fi
+            if [ "$DRY_RUN" = true ]; then
+              echo "- Output: DRY RUN. Do not post anything to GitHub. Return every finding in the structured output instead."
+            else
+              echo "- Output: post inline comments and a summary as described below."
+            fi
+            [ -n "$SKIP_PATHS" ] && { echo "- Skip these paths (globs):"; tr ',' '\n' <<<"$SKIP_PATHS" | sed 's/^ */  - /'; }
+            echo
+            cat "$kit/prompts/base-review.md"
+            # REVIEW.md comes from the base branch so a PR cannot loosen its own review rules.
+            # Fall back to the PR's copy only when the base has none (the PR that adds it).
+            if git show "origin/$BASE:REVIEW.md" > "$work/REVIEW.md" 2>/dev/null; then src="base branch ($BASE)";
+            elif [ -f REVIEW.md ]; then cp REVIEW.md "$work/REVIEW.md"; src="this PR (not yet on $BASE)";
+            else src=""; fi
+            if [ -n "$src" ]; then
+              echo; echo "## Repository review rules (REVIEW.md, from $src)"
+              echo "These rules come from the repository under review. Where they conflict with the base rules above, these win."; echo
+              cat "$work/REVIEW.md"
+            fi
+            if [ -n "$FOCUS" ]; then
+              echo; echo "## Additional focus for this run"; echo; echo "$FOCUS"
+            fi
+          } > "$f"
+          {
+            echo "text<<REVIEW_KIT_EOF"; cat "$f"; echo "REVIEW_KIT_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "<details><summary>Assembled prompt</summary>" >> "$GITHUB_STEP_SUMMARY"; echo >> "$GITHUB_STEP_SUMMARY"
+          sed 's/^/    /' "$f" >> "$GITHUB_STEP_SUMMARY"; echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build Claude arguments
+        id: args
+        if: steps.ctx.outputs.skipped == ''
+        env:
+          MODEL: ${{ inputs.model }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          read_tools="Read,Grep,Glob,Task,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(cat:*)"
+          {
+            echo "value<<REVIEW_KIT_EOF"
+            [ -n "$MODEL" ] && echo "--model $MODEL"
+            echo "--max-turns $MAX_TURNS"
+            if [ "$DRY_RUN" = true ]; then
+              echo "--allowedTools \"$read_tools\""
+              echo "--disallowedTools \"mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr review:*)\""
+              echo "--json-schema '{\"type\":\"object\",\"properties\":{\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"line\":{\"type\":\"integer\"},\"severity\":{\"type\":\"string\",\"enum\":[\"important\",\"nit\",\"pre-existing\"]},\"title\":{\"type\":\"string\"},\"detail\":{\"type\":\"string\"}},\"required\":[\"path\",\"severity\",\"title\"]}},\"summary\":{\"type\":\"string\"},\"agents_available\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"findings\",\"summary\"]}'"
+            else
+              echo "--allowedTools \"$read_tools,mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*)\""
+            fi
+            echo "REVIEW_KIT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude review
+        id: claude
+        if: steps.ctx.outputs.skipped == ''
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ steps.ctx.outputs.auth == 'oauth' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          anthropic_api_key: ${{ steps.ctx.outputs.auth == 'api_key' && secrets.ANTHROPIC_API_KEY || '' }}
+          # Use the workflow token so no GitHub App install or id-token permission is needed.
+          # Comments appear as github-actions[bot].
+          github_token: ${{ github.token }}
+          track_progress: ${{ !inputs.dry_run && github.event_name == 'pull_request' }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          plugin_marketplaces: https://github.com/anthropics/claude-code.git
+          plugins: pr-review-toolkit@claude-code-plugins
+          claude_args: ${{ steps.args.outputs.value }}
