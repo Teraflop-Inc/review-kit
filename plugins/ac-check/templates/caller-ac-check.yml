@@ -9,4 +9,9 @@ permissions:
 jobs:
   ac-check:
     uses: aowen14/review-kit/.github/workflows/ac-check.yml@v1
-    secrets: inherit
+    # Pass secrets by name. `secrets: inherit` only works when this repo and review-kit belong
+    # to the same account, organization, or enterprise; otherwise it passes nothing.
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}

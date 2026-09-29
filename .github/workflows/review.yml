@@ -1,4 +1,4 @@
-# Reusable PR review workflow. Callers invoke it with `uses:` and `secrets: inherit`.
+# Reusable PR review workflow. Callers invoke it with `uses:` and pass secrets by name.
 # See templates/caller-review.yml for the caller and README.md for setup.
 #
 # Layering: mechanics (triggers, fetching, fork/secret guards, posting) live here.
@@ -123,7 +123,7 @@ jobs:
             *)       if [ "$HAS_OAUTH" = true ]; then auth=oauth; elif [ "$HAS_API_KEY" = true ]; then auth=api_key; else auth=""; fi ;;
           esac
           if [ -z "$auth" ]; then
-            msg="No Anthropic credential available (auth_method=$AUTH_METHOD). Add CLAUDE_CODE_OAUTH_TOKEN (from 'claude setup-token') or ANTHROPIC_API_KEY as a repository or org secret, and call this workflow with 'secrets: inherit'."
+            msg="No Anthropic credential available (auth_method=$AUTH_METHOD). Add CLAUDE_CODE_OAUTH_TOKEN (from 'claude setup-token') or ANTHROPIC_API_KEY as a repository or org secret, and pass it to this workflow under 'secrets:' as the caller template does ('secrets: inherit' only works when the caller and review-kit belong to the same account, organization, or enterprise)."
             echo "::error title=review-kit: missing credential::$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"; exit 1
           fi
           echo "auth=$auth" >> "$GITHUB_OUTPUT"

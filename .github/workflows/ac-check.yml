@@ -1,5 +1,5 @@
 # Reusable acceptance-criteria check (ENG2-1656). Callers invoke it with `uses:` and
-# `secrets: inherit`; see plugins/ac-check/templates/caller-ac-check.yml.
+# secrets passed by name; see plugins/ac-check/templates/caller-ac-check.yml.
 #
 # Layering: issue resolution, the Linear fetch, AC parsing, verdict validation, and the
 # comment upsert are deterministic scripts in plugins/ac-check/ac. The only model step is
@@ -87,8 +87,8 @@ jobs:
             *)       if [ "$HAS_OAUTH" = true ]; then auth=oauth; elif [ "$HAS_API_KEY" = true ]; then auth=api_key; else auth=""; fi ;;
           esac
           fail() { echo "::error title=ac-check: missing secret::$1"; echo "$1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
-          [ -n "$auth" ] || fail "No Anthropic credential available (auth_method=$AUTH_METHOD). Add CLAUDE_CODE_OAUTH_TOKEN (from 'claude setup-token') or ANTHROPIC_API_KEY as a repository or org secret, and call this workflow with 'secrets: inherit'."
-          [ "$HAS_LINEAR" = true ] || fail "LINEAR_API_KEY is not available. Add it as a repository or org secret, and call this workflow with 'secrets: inherit'."
+          [ -n "$auth" ] || fail "No Anthropic credential available (auth_method=$AUTH_METHOD). Add CLAUDE_CODE_OAUTH_TOKEN (from 'claude setup-token') or ANTHROPIC_API_KEY as a repository or org secret, and pass it to this workflow under 'secrets:' as the caller template does ('secrets: inherit' only works when the caller and review-kit belong to the same account, organization, or enterprise)."
+          [ "$HAS_LINEAR" = true ] || fail "LINEAR_API_KEY is not available. Add it as a repository or org secret, and pass it to this workflow under 'secrets:' as the caller template does ('secrets: inherit' only works when the caller and review-kit belong to the same account, organization, or enterprise)."
           { echo "auth=$auth"; echo "pr=$PR"; echo "skipped="; } >> "$GITHUB_OUTPUT"
 
       - name: Check out the PR

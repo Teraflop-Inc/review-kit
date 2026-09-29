@@ -1,5 +1,5 @@
 # Reusable review retro (ENG2-1655). Callers own the schedule and invoke it with `uses:`
-# and `secrets: inherit`; see plugins/review-retro/templates/caller-review-retro.yml.
+# and pass secrets by name; see plugins/review-retro/templates/caller-review-retro.yml.
 #
 # Layering: fetch, knowledge-base merge, and the PR are deterministic scripts in
 # plugins/review-retro/retro. The only model step is the review-retro subagent, installed
@@ -77,7 +77,7 @@ jobs:
             *)       if [ "$HAS_OAUTH" = true ]; then auth=oauth; elif [ "$HAS_API_KEY" = true ]; then auth=api_key; else auth=""; fi ;;
           esac
           if [ -z "$auth" ]; then
-            msg="No Anthropic credential available (auth_method=$AUTH_METHOD). Add CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY as a repository or org secret, and call this workflow with 'secrets: inherit'."
+            msg="No Anthropic credential available (auth_method=$AUTH_METHOD). Add CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY as a repository or org secret, and pass it to this workflow under 'secrets:' as the caller template does ('secrets: inherit' only works when the caller and review-kit belong to the same account, organization, or enterprise)."
             echo "::error title=review-retro: missing credential::$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"; exit 1
           fi
           echo "auth=$auth" >> "$GITHUB_OUTPUT"
