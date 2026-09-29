@@ -1,7 +1,69 @@
+# Runs the reusable review workflow against the fixture PR in the test repo on every
+# push to main, before a release moves v1. Dry run: nothing is posted to the fixture PR
+# (this repo's GITHUB_TOKEN cannot write to another repo), and the findings are checked here.
 name: ci
-on: workflow_dispatch
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      auth_method:
+        description: "auto, oauth, or api_key"
+        default: auto
+permissions:
+  contents: read
+  pull-requests: write  # review.yml requests it; dry runs post nothing
 jobs:
-  placeholder:
+  # claude-code-action does not accept `push` events, so a push re-runs this
+  # workflow as workflow_dispatch on the same commit and waits for its result.
+  dispatch:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Run CI as workflow_dispatch and wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          since=$(date -u +%FT%TZ)
+          gh workflow run ci.yml -R "$REPO" --ref "$GITHUB_REF_NAME"
+          for i in $(seq 1 30); do
+            id=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch --commit "$GITHUB_SHA" --json databaseId,createdAt \
+                 --jq "[.[] | select(.createdAt >= \"$since\")][0].databaseId // empty")
+            [ -n "$id" ] && break; sleep 5
+          done
+          [ -n "${id:-}" ] || { echo "::error::Dispatched CI run not found"; exit 1; }
+          echo "Dispatched run: https://github.com/$REPO/actions/runs/$id" | tee -a "$GITHUB_STEP_SUMMARY"
+          gh run watch "$id" -R "$REPO" --exit-status --interval 15 > /dev/null
+
+  review-fixture:
+    if: github.event_name != 'push'
+    uses: ./.github/workflows/review.yml
+    with:
+      repository: aowen14/dev-agent-workshop-starter
+      pr_number: 2
+      dry_run: true
+      auth_method: ${{ inputs.auth_method || 'auto' }}
+    secrets: inherit
+
+  check-findings:
+    needs: review-fixture
     runs-on: ubuntu-latest
     steps:
-      - run: echo "placeholder"
+      - name: Fixture bug must be reported as Important
+        env:
+          FINDINGS: ${{ needs.review-fixture.outputs.findings }}
+          SKIPPED: ${{ needs.review-fixture.outputs.skipped }}
+        run: |
+          set -euo pipefail
+          [ -z "$SKIPPED" ] || { echo "::error::Review was skipped: $SKIPPED"; exit 1; }
+          echo "$FINDINGS" | jq . | tee findings.json
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"; cat findings.json >> "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
+          jq -e '[.findings[] | select(.severity == "important" and (.path | test("database.py")))] | length > 0' findings.json >/dev/null \
+            || { echo "::error::Expected an Important finding on src/database.py (the deliberate pagination bug)."; exit 1; }
+          jq -e '(.agents_available // []) | map(ascii_downcase) | any(test("silent-failure-hunter|pr-test-analyzer"))' findings.json >/dev/null \
+            && echo "pr-review-toolkit agents available." \
+            || echo "::warning::pr-review-toolkit agents were not reported as available."
