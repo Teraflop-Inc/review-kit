@@ -161,7 +161,7 @@ jobs:
         if: steps.ctx.outputs.skipped == ''
         uses: actions/checkout@v5
         with:
-          repository: ${{ job.workflow_repository || 'Teraflop-Inc/review-kit' }}
+          repository: ${{ job.workflow_repository || 'aowen14/review-kit' }}
           ref: ${{ job.workflow_sha || 'v1' }}
           path: .review-kit
           persist-credentials: false

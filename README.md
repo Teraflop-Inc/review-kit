@@ -25,7 +25,7 @@ Use these directly if they fit. review-kit builds on them.
 
    ```bash
    mkdir -p .github/workflows
-   curl -fsSL https://raw.githubusercontent.com/Teraflop-Inc/review-kit/v1/templates/caller-review.yml \
+   curl -fsSL https://raw.githubusercontent.com/aowen14/review-kit/v1/templates/caller-review.yml \
      -o .github/workflows/review.yml
    ```
 
@@ -49,7 +49,7 @@ Use these directly if they fit. review-kit builds on them.
    | [`REVIEW.docs.md`](templates/REVIEW.docs.md) | docs and content repos |
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/Teraflop-Inc/review-kit/v1/templates/REVIEW.app.md -o REVIEW.md
+   curl -fsSL https://raw.githubusercontent.com/aowen14/review-kit/v1/templates/REVIEW.app.md -o REVIEW.md
    ```
 
 4. **Open a PR.** Commit the two files on a branch and open a PR (`gh pr create --fill`). The review posts a progress comment, inline comments on findings, and a summary. The first PR reviews itself.
@@ -80,7 +80,7 @@ All optional. Pass them under `with:` in your caller.
 
 ## Drop-ins
 
-Plugins in this repo's marketplace, installed with `/plugin marketplace add Teraflop-Inc/review-kit`.
+Plugins in this repo's marketplace, installed with `/plugin marketplace add aowen14/review-kit`.
 
 ### AC checker (`ac-check`): coming
 
