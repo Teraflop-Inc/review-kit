@@ -1,0 +1,31 @@
+{
+  "name": "review-kit",
+  "owner": {
+    "name": "Teraflop",
+    "email": "alex@teraflop.io"
+  },
+  "metadata": {
+    "description": "PR review drop-ins that sit next to the review-kit reusable workflow.",
+    "version": "0.0.0"
+  },
+  "plugins": [
+    {
+      "name": "ac-check",
+      "source": "./plugins/ac-check",
+      "description": "Placeholder (ENG2-1656): check a PR against its Linear ticket's acceptance criteria.",
+      "version": "0.0.0"
+    },
+    {
+      "name": "review-retro",
+      "source": "./plugins/review-retro",
+      "description": "Placeholder (ENG2-1655): post-merge retro on what review caught and missed.",
+      "version": "0.0.0"
+    },
+    {
+      "name": "pr-channel",
+      "source": "./plugins/pr-channel",
+      "description": "Placeholder (ENG2-1657): Channels server that streams PR review events into Claude Code.",
+      "version": "0.0.0"
+    }
+  ]
+}
