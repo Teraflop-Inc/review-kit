@@ -261,6 +261,8 @@ jobs:
           # Use the workflow token so no GitHub App install or id-token permission is needed.
           # Comments appear as github-actions[bot].
           github_token: ${{ github.token }}
+          # ci.yml re-dispatches itself as github-actions[bot]. Allowed only for dry runs, which post nothing.
+          allowed_bots: ${{ inputs.dry_run && 'github-actions[bot]' || '' }}
           track_progress: ${{ !inputs.dry_run && github.event_name == 'pull_request' }}
           prompt: ${{ steps.prompt.outputs.text }}
           plugin_marketplaces: https://github.com/anthropics/claude-code.git
