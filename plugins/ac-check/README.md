@@ -74,7 +74,10 @@ permissions:
 jobs:
   ac-check:
     uses: aowen14/review-kit/.github/workflows/ac-check.yml@v1
-    secrets: inherit
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
 ```
 
 It runs when a PR opens and on every push. Draft PRs are skipped until marked ready. Fork PRs are skipped because they get no secrets. A PR with no Linear ID is skipped with a notice and no comment. The workflow installs this plugin from review-kit's marketplace at the exact commit you pinned, so CI and local runs use identical prompts.
@@ -94,7 +97,7 @@ All optional, under `with:`.
 
 ### Secrets
 
-Set these once as **organization secrets** (Organization settings → Secrets and variables → Actions) and give the calling repos access. `secrets: inherit` passes them through, so no repo stores its own copy.
+Set these once as **organization secrets** (Organization settings → Secrets and variables → Actions) and give the calling repos access. The caller passes them to the workflow by name, so no repo stores its own copy. (`secrets: inherit` is not enough: it only works when the calling repo and review-kit belong to the same account, organization, or enterprise.)
 
 | Secret | Needed | Notes |
 |---|---|---|

@@ -69,6 +69,8 @@ Optional: paste [`templates/CLAUDE.fyi-snippet.md`](templates/CLAUDE.fyi-snippet
 ### Troubleshooting
 
 - **"No Anthropic credential available"**: add the secret, then push a new commit (or close and reopen the PR). Re-running an old run can keep the secrets it started with, so a secret added afterwards may not reach it.
+- **"No Anthropic credential available" with the secret set**: check that your caller passes the secrets by name, as [`templates/caller-review.yml`](templates/caller-review.yml) does. An older copy with `secrets: inherit` passes nothing unless your repo and review-kit belong to the same account, organization, or enterprise.
+- **`could not read Username for 'https://github.com'` on a private repo**: private repos are not supported yet. The PR checkout does not keep credentials, and `claude-code-action` then runs `git fetch`, which a private repo refuses.
 - **Fork PR skipped**: expected. Fork PRs never receive secrets. Push the branch to the base repo to get a review.
 - **No review on a draft**: expected. Mark the PR ready for review.
 

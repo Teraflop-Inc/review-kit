@@ -66,7 +66,7 @@ The caller pins `@v1`. The workflow checks out review-kit at that exact commit a
 
 Setup in the calling repo:
 
-- Secret: `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`, as a repo or org secret, passed with `secrets: inherit`.
+- Secret: `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`, as a repo or org secret, passed to the workflow by name as the caller template does. `secrets: inherit` only works when the calling repo and review-kit belong to the same account, organization, or enterprise.
 - Settings → Actions → General → enable **Allow GitHub Actions to create and approve pull requests**, or `GITHUB_TOKEN` cannot open the proposal PR. A PR opened by `GITHUB_TOKEN` does not trigger other workflows, so your review workflow will not run on it; that's fine for a rules proposal.
 
 **Local cron or a Claude Code scheduled task.** Use this for the cross-repo pass, which needs a token that can read several repos:
