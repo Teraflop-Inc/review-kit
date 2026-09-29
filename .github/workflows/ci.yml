@@ -14,7 +14,33 @@ permissions:
   contents: read
   pull-requests: write  # review.yml requests it; dry runs post nothing
 jobs:
+  # claude-code-action does not accept `push` events, so a push re-runs this
+  # workflow as workflow_dispatch on the same commit and waits for its result.
+  dispatch:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Run CI as workflow_dispatch and wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          since=$(date -u +%FT%TZ)
+          gh workflow run ci.yml -R "$REPO" --ref "$GITHUB_REF_NAME"
+          for i in $(seq 1 30); do
+            id=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch --commit "$GITHUB_SHA" --json databaseId,createdAt \
+                 --jq "[.[] | select(.createdAt >= \"$since\")][0].databaseId // empty")
+            [ -n "$id" ] && break; sleep 5
+          done
+          [ -n "${id:-}" ] || { echo "::error::Dispatched CI run not found"; exit 1; }
+          echo "Dispatched run: https://github.com/$REPO/actions/runs/$id" | tee -a "$GITHUB_STEP_SUMMARY"
+          gh run watch "$id" -R "$REPO" --exit-status --interval 15 > /dev/null
+
   review-fixture:
+    if: github.event_name != 'push'
     uses: ./.github/workflows/review.yml
     with:
       repository: aowen14/dev-agent-workshop-starter
